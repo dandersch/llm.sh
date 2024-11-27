@@ -1,0 +1,6 @@
+#+title: llm.sh
+
+Simple bash script to chat with any OpenAI API compatible LLM inside your
+terminal.
+
+[[.github/preview.gif]]
