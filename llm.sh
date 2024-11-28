@@ -25,16 +25,7 @@ if [ -z "$API_TOKEN" ]; then
     fi
 fi
 
-declare -a messages # array that holds conversation history
-
-# Shift to get the query
-# TODO make it so we don't have to enclose the query with quotes
-shift $((OPTIND - 1))
-
-# Join all arguments into a single query string
-QUERY="$*"
-
-# send prompt to openai api
+# send prompt to openai api w/o streaming (NOTE: deprecated)
 function query_openai() {
   local json_messages=$(printf '%s\n' "${messages[@]}" | jq -c -s .)
   local response=$(curl -s -X POST "$API_ENDPOINT" \
@@ -48,10 +39,69 @@ function query_openai() {
   echo "$response"
 }
 
+# streamed openai query using curl & temp files
+function query_openai_streamed() {
+    local json_messages=$(printf '%s\n' "${messages[@]}" | jq -c -s .)
+    curl --silent -X POST "$API_ENDPOINT" \
+        -H "Authorization: Bearer $API_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "model": "'"$MODEL"'",
+            "messages": '"$json_messages"',
+              "stream": true
+              }' --no-buffer > "$temp_file" &
+    curl_pid=$! # store curl command PID
+
+
+    while kill -0 "$curl_pid" 2>/dev/null; do # curl is still processing
+        # Read the new lines from the temporary file
+        # TODO don't reread old lines, keep track of which line was read last
+        while IFS= read -r line; do
+            # Check if the line starts with "data: "
+            if [[ $line == data:* ]]; then
+
+                json_data="${line:6}" # remove "data: " prefix
+
+                # Check if API has finished
+                finish_reason=$(printf '%s' "$json_data" | jq --raw-output '.choices[0].finish_reason // empty')
+                if [[ "$finish_reason" != "eos" ]]; then
+                    # Print the content if it exists NOTE: the sed replacements are a workaround to preserve newlines
+                    # (i.e. "content" : "\n") in the output, since jq --raw-output seems to remove them
+                    content=$(printf '%s' "$json_data" | jq '.choices[0].delta.content // empty' | sed 's/^.//' | sed 's/.$//' | sed 's/\\"/"/g')
+                    if [[ -n $content ]]; then
+                        echo -ne "$content"  # print out response chunk
+                        response+="$content" # add to array
+                        sleep 0.05 # TODO only needed because we may reread old lines
+                    fi
+                else
+                    break 2
+                fi
+            fi
+        done < "$temp_file"
+    done
+
+    > "$temp_file" # clear out temp file
+}
+
+declare -a messages # array that holds conversation history
+temp_file=$(mktemp) # stores streamed-in response
+cleanup() {
+    rm -f "$temp_file"
+    exit
+}
+trap cleanup INT  # delete temp file on Ctrl-C
+trap cleanup EXIT # delete temp file on exit
+
+# TODO support <query> argument
+# TODO make it so we don't have to enclose the query with quotes
+shift $((OPTIND - 1)) # Shift to get the query
+QUERY="$*"            # Join all arguments into a single query string
+
 # Start REPL-like environment
 echo "Entering chat mode. Type 'exit' to quit."
 #echo -e "\e[32m> ${QUERY} \e[0m"
 while true; do
+    # TODO support input with linebreaks
     read -p $'\e[32m> \e[0m' input
 
     if [[ "$input" == "exit" ]]; then
@@ -61,13 +111,10 @@ while true; do
     # add user message to history
     messages+=("$(jq --compact-output --null-input --arg content "$input" '{role: "user", content: $content}')")
 
-    response=$(query_openai) # the response from OpenAI
+    echo -e "\e[34m" # color response blue
+    query_openai_streamed
+    echo -e "\e[0m"
 
     # add assistant message to history
     messages+=("$(jq --compact-output --null-input --arg content "$response" '{role: "assistant", content: $content}')")
-
-    # Print the response
-    echo -e "\e[34m"
-    echo "$response"
-    echo -e "\e[0m"
 done
